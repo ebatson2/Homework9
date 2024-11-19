@@ -1,0 +1,518 @@
+---
+title: "Homework9"
+format: html
+editor: visual
+---
+
+# Reading Data
+
+```{r}
+#| output: false
+
+library(readr)
+library(tidyverse)
+library(lubridate)
+library(corrr)
+library(tidymodels)
+library(rpart)
+library(baguette)
+
+df <- readr::read_csv("SeoulBikeData.csv", locale=locale(encoding="latin1"))
+head(df)
+```
+
+# EDA
+
+First, let's rename the columns to make them easier to work with:
+
+```{r}
+colnames(df) <- gsub(" ", "_", colnames(df))
+
+df <- df |>
+  rename("Temperature_C"="Temperature(°C)") |>
+  rename("Humidity_Percent"="Humidity(%)") |>
+  rename("Wind_speed_m_per_s"="Wind_speed_(m/s)") |>
+  rename("Visibility_10m"="Visibility_(10m)") |>
+  rename("Dew_point_temperature_C"="Dew_point_temperature(°C)") |>
+  rename("Solar_Radiation_MJ_per_sq_m"="Solar_Radiation_(MJ/m2)") |>
+  rename("Rainfall_mm"="Rainfall(mm)") |>
+  rename("Snowfall_cm"="Snowfall_(cm)")
+
+head(df)
+```
+
+Let's do some checking to validate the dataset before we build a model with it:
+
+```{r}
+# check for missing values
+sum_na <- function(column){
+ sum(is.na(column))
+}
+
+na_counts <- df |>
+ summarize(across(everything(), sum_na))
+
+na_counts
+```
+
+There are no NA values in our data. What are the values seen?
+
+```{r}
+cat_vars <- c("Date", "Seasons", "Holiday", "Functioning_Day")
+
+for (var in cat_vars){
+  print(head(unique(df[var])))
+}
+
+table(df$Seasons)
+table(df$Holiday)
+table(df$Functioning_Day)
+```
+
+Convert the Date column to actual date type and other categorical variables into factors:
+
+```{r}
+df <- df |>
+  mutate(Date = parse_date_time(Date, "dmy")) |>
+  mutate(Seasons = as.factor(Seasons)) |>
+  mutate(Holiday = as.factor(Holiday))|>
+  mutate(Functioning_Day = as.factor(Functioning_Day))
+
+df
+```
+
+Calculate summaries to check in with numeric variables:
+
+```{r}
+# function for finding measures of center and spread
+find_center_and_spread <- function(df) {
+  return(df|>
+    summarize(across(where(is.numeric), 
+               list("mean" = mean, "median" = median, "sd"=sd, "IQR"=IQR), 
+               .names = "{.fn}_{.col}")))
+}
+
+# find centers and spread for all numeric vars
+find_center_and_spread(df)
+```
+
+Now that we have cleaned up our column names and datatypes, as well as validated the values in the dataset and confirmed there are no missing values, let's look more into the relationships between our target variable (Rented_Bike_Count) and other variables.
+
+```{r}
+# summarize across categorical variables
+# function for finding measures of center and spread
+find_center_and_spread_grouped <- function(df, group) {
+  return(df|>
+    group_by({{group}}) |>
+    summarize(across(where(is.numeric), 
+               list("mean" = mean, "median" = median, "sd"=sd, "IQR"=IQR), 
+               .names = "{.fn}_{.col}")))
+}
+
+# find centers and spread for all numeric vars, grouped by cat vars
+find_center_and_spread_grouped(df, Seasons)
+find_center_and_spread_grouped(df, Holiday)
+find_center_and_spread_grouped(df, Functioning_Day)
+```
+
+Notes:
+
+-   All Rented_Bike_Count values are 0 for Functioning_Day=No. Since the effects of other variables cannot influence the rentals on these days, we can filter them out to get a better picture of how the other variables influence the target.
+-   Rented_Bike_Count is lower for holidays.
+-   Rented_Bike_Count is highest in summer, followed by autumn, spring, and winter.
+
+Subset the data to filter out Functioning_Day=No:
+
+```{r}
+df_filtered <- df |>
+  filter(Functioning_Day=='Yes')
+
+df
+df_filtered
+```
+
+Combine the rows into 1 row for each day:
+
+```{r}
+day_df <- df_filtered |>
+  group_by(Date, Seasons, Holiday) |>
+  summarise(across(c(Rented_Bike_Count, Rainfall_mm, Snowfall_cm), sum), 
+            across(c(Temperature_C, Humidity_Percent, Wind_speed_m_per_s, Visibility_10m, Dew_point_temperature_C, Solar_Radiation_MJ_per_sq_m), 
+                   mean),
+            .groups='drop')
+
+head(day_df)
+```
+
+Now that the data has been combined for each day, we'll take another look at our summary statistics for categorical and numerical variables:
+
+```{r}
+# categorical vars:
+table(day_df$Seasons)
+table(day_df$Holiday)
+
+# numerical vars:
+find_center_and_spread(day_df)
+
+find_center_and_spread_grouped(day_df, Seasons)
+find_center_and_spread_grouped(day_df, Holiday)
+```
+
+Exploring relationships: plots and correlation values
+
+```{r}
+# categorical vars
+ggplot(day_df, aes(x = Rented_Bike_Count)) + geom_density(alpha = 0.5, aes(fill = Seasons)) + ggtitle("Rented Bike Count By Season")
+ggplot(day_df, aes(x = Rented_Bike_Count)) + geom_density(alpha = 0.5, aes(fill = Holiday)) + ggtitle("Rented Bike Count By Holiday")
+```
+
+```{r}
+# numerical vars
+ggplot(day_df, aes(x = Seasons, y = Rented_Bike_Count, color = Seasons)) + geom_point(position = "jitter") + ggtitle("Rented Bike Count by Season")
+ggplot(day_df, aes(x = Rainfall_mm, y = Rented_Bike_Count)) + geom_point(position = "jitter") + ggtitle("Rented Bike Count vs. Rainfall")
+ggplot(day_df, aes(x = Humidity_Percent, y = Rented_Bike_Count)) + geom_point(position = "jitter") + ggtitle("Rented Bike Count vs. Humidity")
+ggplot(day_df, aes(x = Wind_speed_m_per_s, y = Rented_Bike_Count)) + geom_point(position = "jitter") + ggtitle("Rented Bike Count vs. Wind Speed")
+
+# correlation
+day_df |>
+  select(where(is.numeric)) |>
+  correlate()
+```
+
+Notes:
+
+-   The correlation with Rented Bike Count is strongest for Temperature, Dew Point Temperature, and Solar Radiation.
+
+# Split the Data
+
+We'll split our data into training and test sets, stratified by the variable Seasons, and then create our 10 folds for 10-fold cross validation.
+
+```{r}
+day_split <- initial_split(day_df, prop=0.75, strata=Seasons)
+day_train <- training(day_split)
+day_test <- testing(day_split)
+
+day_10_fold <- vfold_cv(day_train, 10)
+```
+
+# Fitting MLR Models
+
+Creating 3 recipes:
+
+```{r}
+# recipe #1
+recipe_1 <- recipe(Rented_Bike_Count ~ ., data=day_train) |>
+  step_date(Date) |>
+  step_mutate(day_type=factor(if_else(Date_dow %in% c('Sat', 'Sun'), 'weekday', 'weekend'))) |>
+  step_rm(Date, Date_dow) |>
+  step_normalize(all_numeric(), -all_outcomes()) |>
+  step_dummy(Seasons, Holiday, day_type)
+```
+
+```{r}
+# recipe #2
+recipe_2 <- recipe(Rented_Bike_Count ~ ., data=day_train) |>
+  step_date(Date) |>
+  step_mutate(day_type=factor(if_else(Date_dow %in% c('Sat', 'Sun'), 'weekday', 'weekend'))) |>
+  step_rm(Date, Date_dow) |>
+  step_normalize(all_numeric(), -all_outcomes()) |>
+  step_dummy(Seasons, Holiday, day_type) |>
+  step_interact(terms = ~starts_with("Seasons")*starts_with("Holiday")) |>
+  step_interact(terms = ~starts_with("Seasons")*Temperature_C) |>
+  step_interact(terms = ~Temperature_C*Rainfall_mm)
+```
+
+```{r}
+# recipe #3
+recipe_3 <- recipe(Rented_Bike_Count ~ ., data=day_train) |>
+  step_date(Date) |>
+  step_mutate(day_type=factor(if_else(Date_dow %in% c('Sat', 'Sun'), 'weekday', 'weekend'))) |>
+  step_rm(Date, Date_dow) |>
+  step_normalize(all_numeric(), -all_outcomes()) |>
+  step_dummy(Seasons, Holiday, day_type) |>
+  step_interact(terms = ~starts_with("Seasons")*starts_with("Holiday")) |>
+  step_interact(terms = ~starts_with("Seasons")*Temperature_C) |>
+  step_interact(terms = ~Temperature_C*Rainfall_mm) |>
+  step_poly(Rainfall_mm, Snowfall_cm, Temperature_C, Humidity_Percent, Wind_speed_m_per_s, Visibility_10m, Dew_point_temperature_C, Solar_Radiation_MJ_per_sq_m)
+```
+
+Set up a linear model:
+
+```{r}
+day_mod <- linear_reg() |>
+  set_engine("lm")
+```
+
+Train with 10-fold CV with each recipe and look at the metrics for all:
+
+```{r}
+day_CV_fits_1 <- workflow() |>
+  add_recipe(recipe_1) |>
+  add_model(day_mod) |>
+  fit_resamples(day_10_fold)
+
+day_CV_fits_2 <- workflow() |>
+  add_recipe(recipe_2) |>
+  add_model(day_mod) |>
+  fit_resamples(day_10_fold)
+
+day_CV_fits_3 <- workflow() |>
+  add_recipe(recipe_3) |>
+  add_model(day_mod) |>
+  fit_resamples(day_10_fold)
+
+rbind(day_CV_fits_1 |> collect_metrics(),
+ day_CV_fits_2 |> collect_metrics(),
+ day_CV_fits_3 |> collect_metrics())
+```
+
+Best model: recipe #1!
+
+Now let's train using recipe 1 with the entire training dataset:
+
+```{r}
+day_wfl <- workflow() |>
+  add_recipe(recipe_1) |>
+  add_model(day_mod)
+
+fit <- day_wfl |>
+  last_fit(day_split)
+
+# test set metrics
+fit |>
+  collect_metrics()
+```
+
+Finally, let's train on the entire dataset:
+
+```{r}
+# fit on all data
+full_fit <-day_wfl |>
+  fit(day_df)
+
+full_fit |>
+  extract_fit_parsnip() |>
+  tidy()
+```
+
+# HW9: Modeling Practice
+
+Let's train a few other types of models and see how the results compare! We'll first find the best tuning parameters for each type of model using 10-fold cross validation. Then we'll train our best model for each model type on the entire training dataset.
+
+First up: LASSO model
+
+```{r}
+# create LASSO recipe using recipe from HW8
+LASSO_recipe <- recipe(Rented_Bike_Count ~ ., data=day_train) |>
+  step_date(Date) |>
+  step_mutate(day_type=factor(if_else(Date_dow %in% c('Sat', 'Sun'), 'weekday', 'weekend'))) |>
+  step_rm(Date, Date_dow, Date_month, Date_year) |>
+  step_normalize(all_numeric(), -all_outcomes()) |>
+  step_dummy(Seasons, Holiday, day_type)
+
+# use LASSO model from parsnip
+LASSO_model <- linear_reg(penalty = tune(), mixture = 1) |>
+  set_engine("glmnet")
+
+# create LASSO workflow
+LASSO_wfl <- workflow() |>
+  add_recipe(LASSO_recipe) |>
+  add_model(LASSO_model)
+
+# use a grid search for tuning parameter
+LASSO_grid <- LASSO_wfl |>
+  tune_grid(resamples = day_10_fold) 
+
+# use RMSE to determine the best model (i.e. that with the best tuning parameter value)
+LASSO_best <- LASSO_grid |>
+  select_best(metric = "rmse")
+
+LASSO_final_wfl <- LASSO_wfl |>
+  finalize_workflow(LASSO_best)
+
+LASSO_final_wfl |>
+  last_fit(day_split) |>
+  collect_metrics()
+
+LASSO_final <- LASSO_final_wfl |>
+  fit(day_train)
+```
+
+Notes:
+
+- All RMSE values were the same during parameter tuning, so the parameter value appears to have no effect on the model performance.
+
+Regression Tree model
+
+```{r}
+# same recipe works for tree
+tree_recipe <- LASSO_recipe
+
+# use decision tree model from parsnip
+tree_model <- decision_tree(tree_depth = tune(),
+                          min_n = 20,
+                          cost_complexity = tune()) |>
+  set_engine("rpart") |>
+  set_mode("regression")
+
+# create tree workflow
+tree_wfl <- workflow() |>
+  add_recipe(tree_recipe) |>
+  add_model(tree_model)
+
+# use a grid search for tuning parameter
+tree_grid <- tree_wfl |> 
+  tune_grid(resamples = day_10_fold)
+
+# use RMSE to determine the best model (i.e. that with the best tuning parameter value)
+tree_best <- select_best(tree_grid, metric="rmse")
+
+tree_final_wfl <- tree_wfl |>
+  finalize_workflow(tree_best)
+
+tree_final_wfl |>
+  last_fit(day_split) |>
+  collect_metrics()
+
+tree_final <- tree_final_wfl |>
+  fit(day_train)
+```
+
+Notes:
+
+- much better performance from the decision tree model than LASSO!
+
+Bagged Tree model
+
+```{r}
+# same recipe works for bagged tree
+bag_recipe <- LASSO_recipe
+
+# use bagged tree model from parsnip
+bag_model <- bag_tree(tree_depth = 7, min_n = 10, cost_complexity = tune()) |>
+ set_engine("rpart") |>
+ set_mode("regression")
+
+# create bagged tree workflow
+bag_wfl <- workflow() |>
+ add_recipe(bag_recipe) |>
+ add_model(bag_model)
+
+# use a grid search for tuning parameter
+bag_grid <- bag_wfl |>
+ tune_grid(resamples = day_10_fold,
+ grid = grid_regular(cost_complexity(),
+ levels = 10))
+
+# use RMSE to determine the best model (i.e. that with the best tuning parameter value)
+bag_best <- select_best(bag_grid, metric="rmse")
+
+bag_final_wfl <- bag_wfl |>
+  finalize_workflow(bag_best)
+
+bag_final_wfl |>
+  last_fit(day_split) |>
+  collect_metrics()
+
+bag_final <- bag_final_wfl |>
+  fit(day_train)
+```
+
+Notes:
+
+- The bagged tree model did even better than the single tree.
+
+Random Forest model
+
+```{r}
+# same recipe works for random forest
+rf_recipe <- LASSO_recipe
+
+# use random forest model from parsnip
+rf_model <- rand_forest(mtry = tune()) |>
+ set_engine("ranger") |>
+ set_mode("regression")
+
+# create random forest workflow
+rf_wfl <- workflow() |>
+ add_recipe(rf_recipe) |>
+ add_model(rf_model)
+
+# use a grid search for tuning parameter
+rf_grid <- rf_wfl |>
+ tune_grid(resamples = day_10_fold,
+ grid = 10)
+
+# use RMSE to determine the best model (i.e. that with the best tuning parameter value)
+rf_best <- select_best(rf_grid, metric="rmse")
+
+rf_final_wfl <- rf_wfl |>
+  finalize_workflow(rf_best)
+
+rf_final_wfl |>
+  last_fit(day_split) |>
+  collect_metrics()
+
+rf_final <- rf_final_wfl |>
+  fit(day_train)
+```
+
+Notes:
+
+- The random forest is the best performing model, according to the test set.
+
+Now that we've tuned a model from each family of models, and trained each on the entire training set, let's compare using the test dataset and RMSE, MAE metrics:
+
+```{r}
+# get final MLR model
+MLR_final <- day_wfl |>
+  fit(day_train)
+
+# get all metrics
+metrics <- rbind(
+  MLR_RMSE = MLR_final |> predict(day_test) |> pull() |> rmse_vec(truth = day_test$Rented_Bike_Count),
+  MLR_MAE = MLR_final |> predict(day_test) |> pull() |> mae_vec(truth = day_test$Rented_Bike_Count),
+  
+  LASSO_RMSE = LASSO_final |> predict(day_test) |> pull() |> rmse_vec(truth = day_test$Rented_Bike_Count),
+  LASSO_MAE = LASSO_final |> predict(day_test) |> pull() |> mae_vec(truth = day_test$Rented_Bike_Count),
+  
+  tree_RMSE = tree_final |> predict(day_test) |> pull() |> rmse_vec(truth = day_test$Rented_Bike_Count),
+  tree_MAE = tree_final |> predict(day_test) |> pull() |> mae_vec(truth = day_test$Rented_Bike_Count),
+  
+  bagged_tree_RMSE = bag_final |> predict(day_test) |> pull() |> rmse_vec(truth = day_test$Rented_Bike_Count),
+  bagged_tree_MAE = bag_final |> predict(day_test) |> pull() |> mae_vec(truth = day_test$Rented_Bike_Count),
+  
+  random_forest_RMSE = rf_final |> predict(day_test) |> pull() |> rmse_vec(truth = day_test$Rented_Bike_Count),
+  random_forest_MAE = rf_final |> predict(day_test) |> pull() |> mae_vec(truth = day_test$Rented_Bike_Count))
+
+colnames(metrics) = c("Error")
+
+metrics
+```
+
+Let's also see a summary of each final model:
+
+```{r}
+MLR_final |> extract_fit_parsnip() |> tidy()
+LASSO_final |> extract_fit_parsnip() |> tidy()
+
+tree_final |> extract_fit_engine() |> rpart.plot::rpart.plot(roundint = FALSE)
+
+bag_model_extracted <- extract_fit_engine(bag_final)
+bag_model_extracted$imp |>
+ mutate(term = factor(term, levels = term)) |>
+ ggplot(aes(x = term, y = value)) +
+ geom_bar(stat ="identity") +
+ coord_flip()
+```
+
+Notes:
+
+- The best family of models that we tested is the random forest! Now we can train that model on the entire dataset to get a final model:
+
+```{r}
+rf_final_model <- rf_final_wfl |>
+  fit(day_df)
+
+rf_final_model
+```
